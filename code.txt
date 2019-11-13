@@ -1,0 +1,169 @@
+#All the files we need are saved in the cluster. Specifically, we have the following tables:
+
+```{bash}
+module load bio
+srun --pty -p staclass bash -i
+sqlite> .tables
+agency                         subtier_agency               
+awards                         toptier_agency               
+recipient_lookup               universal_transaction_matview
+state_data    
+```
+
+#The agency table has a toptier_agency pointer for each and every agency. This will help us determine the general function of a given agency. We can look at the schema of agency table:
+
+```{bash}
+sqlite> .schema agency
+CREATE TABLE `agency` (
+  `id` INTEGER,
+  `create_date` REAL,
+  `update_date` REAL,
+  `toptier_flag` INTEGER,
+  `office_agency_id` INTEGER,
+  `subtier_agency_id` INTEGER,
+  `toptier_agency_id` INTEGER
+);
+```
+
+#The universal_transaction_matview keeps the records of the transactions/modifications on awards. However, there seem to be problems of duplicates. We can query those duplicates:
+
+```{bash}
+sqlite -header -csv /scratch/usaspending.sqlite "SELECT a.* FROM universal_transaction_matview a
+JOIN (SELECT action_date, fiscal_year, total_obligation, awarding_agency_id, funding_agency_id, count(*)
+FROM universal_transaction_matview
+GROUPBY action_date, fiscal_year, total_obligation, awarding_agency_id, funding_agency_id
+HAVING count(*) > 1 ) b
+ON a.action_date = b.action_date
+AND a.fiscal_year = b.fiscal_year
+AND a.total_obligation = b.total_obligation
+AND a.awarding_agency_id = b.awarding_agency_id
+AND a.funding_agency_id = b.awarding_agency_id;" > dupes.csv
+```
+
+#The assumptions of duplicates are having the same action_date, fiscal_year, total_obligation, awarding_agency_id and funding_agency_id. Looking at those exmaples, we find that they usually occur when generated_pragmatic_obligations are different. However, the summary data from the seemingly distinct transaction does not add up. As a result, we decided to move forward with awards table.
+
+#Next, we pulled the annual spending for each agency from awards table and saved the data to agg_awards:
+
+```{bash}
+# generates aggregated annual spending for each awarding/funding agency
+sqlite3 -header -csv /scratch/usaspending.sqlite "SELECT fiscal_year, awarding_agency_id, funding_agency_id,
+SUM(total_obligation) as annual_spending
+FROM awards
+GROUP BY fiscal_year, awarding_agency_id, funding_agency_id;" > agg_awards.csv
+```
+
+
+```{bash}
+# Pulling data from database tables and saving them to local csv files
+sqlite3 -header -csv /scratch/usaspending.sqlite "SELECT * FROM agency;" > agency.csv
+```
+```{bash}
+sqlite3 -header -csv /scratch/usaspending.sqlite "SELECT * FROM toptier_agency;" > toptier_agency.csv
+```
+
+
+
+```{python3}
+# join agency table and toptier_agency table. 
+agency = pd.read_csv('agency.csv')
+toptier_agency = pd.read_csv('toptier_agency.csv')
+left_cols = ['id', 'toptier_agency_id']
+right_cols = ['toptier_agency_id', 'name', 'COFOG']
+agency_category = agency[left_cols].merge(toptier_agency[right_cols], how='left', on='toptier_agency_id')
+agency_category.columns = ['id', 'toptier_agency_id', 'toptier_agency_name', 'COFOG']
+agency_category['COFOG_name'] = agency_category['COFOG']
+# map the COFOG numbers to the actual names
+agency_category.loc[agency_category['COFOG'] == 1, 'COFOG_name'] = 'General public services'
+agency_category.loc[agency_category['COFOG'] == 2, 'COFOG_name'] = 'Defense'
+agency_category.loc[agency_category['COFOG'] == 3, 'COFOG_name'] = 'Public order and safety'
+agency_category.loc[agency_category['COFOG'] == 4, 'COFOG_name'] = 'Economic affairs'
+agency_category.loc[agency_category['COFOG'] == 5, 'COFOG_name'] = 'Environmental protection'
+agency_category.loc[agency_category['COFOG'] == 6, 'COFOG_name'] = 'Housing and community services'
+agency_category.loc[agency_category['COFOG'] == 7, 'COFOG_name'] = 'Health'
+agency_category.loc[agency_category['COFOG'] == 8, 'COFOG_name'] = 'Recreation, culture and religion'
+agency_category.loc[agency_category['COFOG'] == 9, 'COFOG_name'] = 'Education'
+agency_category.loc[agency_category['COFOG'] == 10, 'COFOG_name'] = 'Social protection'
+# save the dataframe to csv
+agency_category.to_csv('agency_category.csv')
+# examples
+agency_category.tail()
+
+# Now we can join agg_awards, which has the annual spending of each agency, together with agency_category.
+agg_awards = pd.read_csv('agg_awards.csv')
+agg_awards = agg_awards.fillna(0)
+agency_award = agg_awards.merge(agency_category, how='left', left_on='awarding_agency_id', right_on='id')
+agency_award.tail()
+
+# calculates the annual percentages of each function relative to that year's total annual spending 
+category_award = agency_award.groupby(['fiscal_year', 'COFOG_name']).agg({'annual_spending': np.sum}).reset_index()
+category_percent_array = category_award['annual_spending'] / category_award.groupby(['fiscal_year'])['annual_spending'].transform('sum')
+d = {'fiscal_year': category_award['fiscal_year'],
+    'COFOG_name': category_award['COFOG_name'],
+    'percent': category_percent_array}
+category = pd.DataFrame(data=d)
+# keeping the summarized data after 2001 (including)
+category = category[category['fiscal_year'] > 2000]
+category.tail()
+
+ggplot(category)\
++ aes('fiscal_year', "percent", group='COFOG_name', color="COFOG_name")\
++ geom_point() + geom_line()\
++ p9.labels.ylab('Percentage relative to annual spending')\
++ p9.labels.ggtitle("Annual Percentages for All Functions")
+
+temp_df = category[category['COFOG_name'].str.contains(
+    "Defense|Economic affairs|General public services|Public order and safety|Health|Social protection")]
+ggplot(temp_df)\
++ aes('fiscal_year', "percent", group='COFOG_name', color="COFOG_name")\
++ geom_point() + geom_line()\
++ p9.labels.ylab('Percentage relative to annual spending')\
++ p9.labels.ggtitle("Annual Percentages for All Functions")
+
+annual_spending_by_year = agg_awards.groupby(['fiscal_year']).agg({'annual_spending': np.sum}).reset_index()
+annual_spending_by_year = annual_spending_by_year[annual_spending_by_year['fiscal_year'] > 2000]
+annual_spending_by_year.plot(x='fiscal_year', y='annual_spending')
+
+temp_df = category[category['COFOG_name'].str.contains(
+    "Education|Environmental protection|Housing and community services|Recreation")]
+ggplot(temp_df)\
++ aes('fiscal_year', "percent", group='COFOG_name', color="COFOG_name")\
++ geom_point() + geom_line()\
++ p9.labels.ylab('Percentage relative to annual spending')\
++ p9.labels.ggtitle("Annual Percentages for All Functions")
+
+parties = pd.read_csv('parties.csv')
+parties = parties[(parties['year'] > 2008) & (parties['year'] < 2019)]
+
+test_df = category[category['fiscal_year'] > 2008]
+temp_df = test_df[test_df['COFOG_name'].str.contains(
+    "Defense|Economic affairs|General public services|Public order and safety|Health|Social protection")]
+ggplot(temp_df)\
++ aes('fiscal_year', "percent", group='COFOG_name', color="COFOG_name")\
++ geom_point() + geom_line()\
++ p9.labels.ylab('Percentage relative to annual spending')\
++ p9.labels.ggtitle("Annual Percentages for All Functions after 2009")
+
+# keep data from 2009 to 2018. Assign 'D' to rows before 2015 and 'R' to rows starting 2015.
+category_award = category_award[(category_award['fiscal_year'] > 2008) & (category_award['fiscal_year'] < 2019)]
+def f(row):
+    if row['fiscal_year'] < 2015:
+        val = 'D'
+    else:
+        val = 'R'
+    return val
+
+category_award['in_power'] = category_award.apply(f, axis=1)
+before_after_2015 = category_award.groupby(['COFOG_name', 'in_power']).agg({'annual_spending': np.sum}).reset_index()
+before_after_2015.columns = ['COFOG_name', 'in_power', 'total_spending']
+percent_array = before_after_2015['total_spending'] / before_after_2015.groupby(['in_power'])['total_spending'].transform('sum')
+
+d = {'COFOG_name': before_after_2015['COFOG_name'],
+    'in_power': before_after_2015['in_power'],
+    'percent': percent_array}
+before_after_2015 = pd.DataFrame(data=d)
+
+ggplot(before_after_2015)\
++ aes('COFOG_name', 'percent', color = 'in_power', fill='in_power') + geom_col()\
++ coord_flip()\
++ p9.labels.ggtitle("Spending on Funtions prior/after 2015")
+```
